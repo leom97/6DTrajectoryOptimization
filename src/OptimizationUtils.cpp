@@ -1,6 +1,9 @@
-//
-// Created by lupta on 1/20/2022.
-//
+/*
+ * Created by leom97 on 1/20/2022.
+ *
+ * File containing routines and classes to do nonlinear optimization in a window of keyframes, using the optimizer Ceres
+ *
+ */
 
 #include "OptimizationUtils.h"
 #include <string>
@@ -18,6 +21,125 @@
 using namespace std;
 using namespace Eigen;
 
+
+
+/** The main optimization function
+  * Given a window of frames, performs an optimization in this window
+  * We optimize for poses, map points, instrinsics
+  * We essentially set up a ceres problem, by adding all optimization variables to it, and then all the cost function terms
+  *
+  * @param globalProblem: contains several information of the global (not windowed) optimization problem
+  * @param kf_i: initial keyframe of window
+  * @param kf_f: final keyframe of window
+  * @param keyframes: a vector of keyframes, each containing various interesting information (e.g. the pose fo the keyframe)
+  * @param map: the set of all observed 3D points
+  * @param intrinsics_initial: instrinsics of camera as given by the datasheet
+  * @param intrinsics_optimized: optimized intrinsics
+  * @return success flag
+  */
+bool windowOptimize(ceresGlobalProblem &globalProblem, int kf_i, int kf_f, vector<KeyFrame> &keyframes, Map3D &map,
+                    const Vector4d &intrinsics_initial, Vector4d &intrinsics_optimized) {    
+
+    ceres::Problem problem; // Optimization variables, poses, map and intrinsics_initial
+    ceres::Solver::Summary summary;
+
+    // Some optimization related stuff which is owned by the problem, as ceres says (so, can't be put into config)
+    ceres::LocalParameterization *local_parametrization_se3 = new Sophus::LocalParameterizationSE3;
+    auto *loss_function_repr = new ceres::LossFunctionWrapper(new ceres::HuberLoss(globalProblem.HUB_P_REPR),
+                                                              ceres::TAKE_OWNERSHIP);
+    auto *loss_function_unpr = new ceres::LossFunctionWrapper(new ceres::HuberLoss(globalProblem.HUB_P_UNPR),
+                                                              ceres::TAKE_OWNERSHIP);
+
+
+    set<int> already_observed_pts;  // we will visit a 3D map point more than once below. We need this not to apply T1->i twice
+
+    auto initialPose = keyframes[kf_i].T_w_c;
+    auto initialPoseInv = keyframes[kf_i].T_w_c.inverse();
+
+    // Add all parameter blocks to the problem, create the residuals
+    // Deal with intrinsics
+    problem.AddParameterBlock(intrinsics_optimized.data(), 4);
+    problem.AddResidualBlock(
+            IntrinsicsPrior::create_cost_function(intrinsics_initial, globalProblem.WEIGHT_INTRINSICS),
+            nullptr, // squared loss
+            intrinsics_optimized.data()
+    );
+    int admissible_obs = countConstraints(map, keyframes, kf_i, kf_f);
+    // Deal with poses, map points (only the relevant ones)
+    for (int kf_n = kf_i; kf_n <= kf_f; kf_n++) {
+
+        // Modify the poses, make them relative to the first frame, add them to the problem
+        auto &curr_kf = keyframes[kf_n];
+        curr_kf.T_w_c = Sophus::SE3d(initialPoseInv * curr_kf.T_w_c);
+        // This is the respective pose to be optimized
+        auto &pose = curr_kf.T_w_c;
+        problem.AddParameterBlock(pose.data(),
+                                  Sophus::SE3d::num_parameters,
+                                  local_parametrization_se3
+        );
+
+        // Run over all observations of this keyframe
+        for (auto index_pair: curr_kf.global_points_map) {
+            int landmarkId = index_pair.second;   // id into the 3d map of this observed point
+            int localId = index_pair.first;
+
+            auto depth = curr_kf.points3d_local[localId](2);
+            Vector2d pix_coords(curr_kf.keypoints[localId].pt.x, curr_kf.keypoints[localId].pt.y);
+
+            // Discard this observation if it has negative depth. todo: to be removed
+            if (depth <= 1e-15) {
+                // cout << "Negative and thus unadmissible depth" << endl;
+                continue;
+            }
+            // Check if we never observed such a point. If so, move it to 1st frame of reference
+            auto &map_point = map.at(landmarkId);
+            if (already_observed_pts.find(landmarkId) == already_observed_pts.end()) {
+                already_observed_pts.insert(landmarkId);
+                // Move this point into frame kf_i
+                map_point.point = initialPoseInv * map_point.point;   //yes, this works
+                problem.AddParameterBlock(map_point.point.data(), 3);
+            }
+
+            // Reprojection
+            problem.AddResidualBlock(
+                    ReprojectionConstraint::create_cost_function(pix_coords, 1.0/admissible_obs),
+                    loss_function_repr,
+                    pose.data(), // (global) camera pose during observation
+                    map_point.point.data(), // 3D point
+                    intrinsics_optimized.data()
+            );
+
+            // Unprojection
+            problem.AddResidualBlock(
+                    DepthPrior::create_cost_function(pix_coords,
+                                                     depth, globalProblem.WEIGHT_UNPR/admissible_obs),
+                    loss_function_unpr,
+                    pose.data(),
+                    map_point.point.data(),
+                    intrinsics_optimized.data());
+        }
+
+    }
+
+    // Solve the problem
+    problem.SetParameterBlockConstant(keyframes[kf_i].T_w_c.data()); // any pose, kept constant, will do
+    ceres::Solve(globalProblem.options, &problem, &summary);
+
+    // Re-put everything in the correct frame, both poses and map points which we messed up with
+    for (int kf_n = kf_i; kf_n <= kf_f; kf_n++) {
+        // Remodify the poses
+        auto &curr_kf = keyframes[kf_n];
+        curr_kf.T_w_c = Sophus::SE3d(initialPose * curr_kf.T_w_c);  // 1->W * C->1 = C->W
+    }
+    for (int lId: already_observed_pts) {
+        map.at(lId).point = initialPose * map.at(lId).point;
+    }
+
+    return true;
+}
+
+
+// Ceres cost function, which measures the reprojection error
 class ReprojectionConstraint {
 public:
     ReprojectionConstraint(Vector2d pPix, const double &weight) : p_pix(std::move(pPix)), weight(weight) {}
@@ -61,6 +183,7 @@ private:
 };
 
 
+// Ceres cost function, acting as a prior
 // We make sure not to get too far away from the depths measured from the depth sensor
 class DepthPrior {
 public:
@@ -106,6 +229,8 @@ private:
     double depth;
 };
 
+
+// Ceres cost function, acting as a prior
 // We make sure not to get too far away from the ROS default intrinsics
 class IntrinsicsPrior {
 public:
@@ -136,181 +261,6 @@ private:
     double weight;  // to weight this residual
 };
 
-/**
- * Reads camera intrinsics data from the target file.
- *
- * Intrinsics format: (fx, fy, cx, cy)
- *
- * @return a vector of doubles containing intrinsics in aforementioned format.
- */
-Vector4d read_camera_intrinsics_from_file(const string &file_path) {
-    ifstream infile;
-    infile.open(file_path);
-    double fx, fy, cx, cy, d0, d1, d2, d3, d4;
-    while (infile >> fx >> fy >> cx >> cy >> d0 >> d1 >> d2 >> d3 >> d4) {
-        // reads only the first line and then closes.
-    }
-    infile.close();
-
-    Vector4d intrinsics;
-    intrinsics << fx, fy, cx, cy;
-    return intrinsics;
-}
-
-void write_keyframe_poses_to_file(const string &file_path, const vector<KeyFrame> & keyframes) {
-    ofstream outfile(file_path);
-    for (auto &keyframe: keyframes) {
-        auto & t = keyframe.T_w_c.translation();
-        auto & q = keyframe.T_w_c.unit_quaternion();
-        outfile << keyframe.timestamp << " ";
-        outfile << t.x() << " " << t.y() << " " << t.z() << " ";
-        outfile << q.x() << " " << q.y() << " " << q.z() << " " << q.w();
-        outfile << "\n";
-    }
-    outfile.close();
-    cout << "Writing keyframe poses to file: " << file_path << " successful.";
-}
-
-int findLocalPointIndex(const KeyFrame &keyframe, const int landmarkId) {
-    int local_index = -1;
-    for (auto &map_it: keyframe.global_points_map) {
-        if (map_it.second == landmarkId) {
-            local_index = map_it.first;
-        }
-    }
-    return local_index;
-}
-
-int countConstraints(const Map3D &map, const vector<KeyFrame> &keyframes, int kf_i, int kf_f) {
-
-    int admissible_obs = 0;
-
-    // Poses, map points (only the relevant ones)
-    for (int kf_n = kf_i; kf_n <= kf_f; kf_n++) {
-
-        // Modify the poses, make them relative to the first frame, add them to the problem
-        auto &curr_kf = keyframes[kf_n];
-
-        // Run over all observations of this keyframe
-        for (auto index_pair: curr_kf.global_points_map) {
-            int localId = index_pair.first;
-
-            auto depth = curr_kf.points3d_local[localId](2);
-
-            // Discard this observation if it has negative depth. todo: to be removed
-            if (depth <= 1e-15) {
-                cout << "Negative and thus unadmissible depth " << depth << endl;
-                continue;
-            }
-
-            admissible_obs++;
-
-        }
-    }
-
-    return admissible_obs;
-
-}
-
-bool windowOptimize(ceresGlobalProblem &globalProblem, int kf_i, int kf_f, vector<KeyFrame> &keyframes, Map3D &map,
-                    const Vector4d &intrinsics_initial, Vector4d &intrinsics_optimized) {
-
-    ceres::Problem problem; // Optimization variables, poses, map and intrinsics_initial
-    ceres::Solver::Summary summary;
-
-    // Some optimization related stuff which is owned by the problem, as ceres says (so, can't be put into config)
-    ceres::LocalParameterization *local_parametrization_se3 = new Sophus::LocalParameterizationSE3;
-    auto *loss_function_repr = new ceres::LossFunctionWrapper(new ceres::HuberLoss(globalProblem.HUB_P_REPR),
-                                                              ceres::TAKE_OWNERSHIP);
-    auto *loss_function_unpr = new ceres::LossFunctionWrapper(new ceres::HuberLoss(globalProblem.HUB_P_UNPR),
-                                                              ceres::TAKE_OWNERSHIP);
-
-
-    set<int> already_observed_pts;  // we will visit a 3D map point more than once below. We need this not to apply T1->i twice
-
-    auto initialPose = keyframes[kf_i].T_w_c;
-    auto initialPoseInv = keyframes[kf_i].T_w_c.inverse();
-
-    // Add all parameter blocks to the problem, create the residuals
-    // Intrinsics
-    problem.AddParameterBlock(intrinsics_optimized.data(), 4);
-    problem.AddResidualBlock(
-            IntrinsicsPrior::create_cost_function(intrinsics_initial, globalProblem.WEIGHT_INTRINSICS),
-            nullptr, // squared loss
-            intrinsics_optimized.data()
-    );
-    int admissible_obs = countConstraints(map, keyframes, kf_i, kf_f);
-    // Poses, map points (only the relevant ones)
-    for (int kf_n = kf_i; kf_n <= kf_f; kf_n++) {
-
-        // Modify the poses, make them relative to the first frame, add them to the problem
-        auto &curr_kf = keyframes[kf_n];
-        curr_kf.T_w_c = Sophus::SE3d(initialPoseInv * curr_kf.T_w_c);
-        // This is the respective pose to be optimized
-        auto &pose = curr_kf.T_w_c;
-        problem.AddParameterBlock(pose.data(),
-                                  Sophus::SE3d::num_parameters,
-                                  local_parametrization_se3
-        );
-
-        // Run over all observations of this keyframe
-        for (auto index_pair: curr_kf.global_points_map) {
-            int landmarkId = index_pair.second;   // id into the 3d map of this observed point
-            int localId = index_pair.first;
-
-            auto depth = curr_kf.points3d_local[localId](2);
-            Vector2d pix_coords(curr_kf.keypoints[localId].pt.x, curr_kf.keypoints[localId].pt.y);
-
-            // Discard this observation if it has negative depth. todo: to be removed
-            if (depth <= 1e-15) {
-//                cout << "Negative and thus unadmissible depth" << endl;
-                continue;
-            }
-            // Check if we never observed such a point. If so, move it to 1st frame of reference
-            auto &map_point = map.at(landmarkId);
-            if (already_observed_pts.find(landmarkId) == already_observed_pts.end()) {
-                already_observed_pts.insert(landmarkId);
-                // Move this point into frame kf_i
-                map_point.point = initialPoseInv * map_point.point;   //yes, this works
-                problem.AddParameterBlock(map_point.point.data(), 3);
-            }
-
-            // Reprojection
-            problem.AddResidualBlock(
-                    ReprojectionConstraint::create_cost_function(pix_coords, 1.0/admissible_obs),
-                    loss_function_repr,
-                    pose.data(), // (global) camera pose during observation
-                    map_point.point.data(), // 3D point
-                    intrinsics_optimized.data()
-            );
-
-            // Unprojection
-            problem.AddResidualBlock(
-                    DepthPrior::create_cost_function(pix_coords,
-                                                     depth, globalProblem.WEIGHT_UNPR/admissible_obs),
-                    loss_function_unpr,
-                    pose.data(),
-                    map_point.point.data(),
-                    intrinsics_optimized.data());
-        }
-
-    }
-
-    problem.SetParameterBlockConstant(keyframes[kf_i].T_w_c.data()); // any pose, kept constant, will do
-    ceres::Solve(globalProblem.options, &problem, &summary);
-
-    // Re-put everything in the correct frame, both poses and map points which we messed up with
-    for (int kf_n = kf_i; kf_n <= kf_f; kf_n++) {
-        // Remodify the poses
-        auto &curr_kf = keyframes[kf_n];
-        curr_kf.T_w_c = Sophus::SE3d(initialPose * curr_kf.T_w_c);  // 1->W * C->1 = C->W
-    }
-    for (int lId: already_observed_pts) {
-        map.at(lId).point = initialPose * map.at(lId).point;
-    }
-
-    return true;
-}
 
 /**
  * Read the ground_truth.txt file and fetch the pose from ground_truth.txt timestamp, which
@@ -366,13 +316,10 @@ Sophus::SE3d getFirstPose(const string &first_timestamp, const string &ground_tr
             tzs[ firstPoseIndex ]);
     Sophus::SE3d::Point tr(t.x(), t.y(), t.z());
     Sophus::SE3d initialPose(q, tr);
-//    cout.precision(17);
-//    cout << "Input timestamp: " << first_timestamp << endl;
-//    cout << "Closest timestamp: " << interpolatedTimestamps[0] << endl;
-//    cout << "Pose (eigen, sophus): " << t.transpose() << " " << initialPose.translation().transpose() << " | " << initialPose.unit_quaternion() << endl;
-
+    
     return initialPose;
 }
+
 
 void poseOffset(vector<KeyFrame> &keyframes, const Sophus::SE3d &initial_pose) {
     auto delta_pose = initial_pose * keyframes[0].T_w_c.inverse();  // C0 -> W * (C0 -> W_fictitious)^{-1} = W_fictitious -> W
@@ -381,4 +328,101 @@ void poseOffset(vector<KeyFrame> &keyframes, const Sophus::SE3d &initial_pose) {
     for (auto & kf : keyframes){
         kf.T_w_c =  delta_pose *  kf.T_w_c;
     }
+}
+
+/**
+ * Reads camera intrinsics data from the target file.
+ *
+ * Intrinsics format: (fx, fy, cx, cy)
+ *
+ * @return a vector of doubles containing intrinsics in aforementioned format.
+ */
+Vector4d read_camera_intrinsics_from_file(const string &file_path) {
+    ifstream infile;
+    infile.open(file_path);
+    double fx, fy, cx, cy, d0, d1, d2, d3, d4;
+    while (infile >> fx >> fy >> cx >> cy >> d0 >> d1 >> d2 >> d3 >> d4) {
+        // reads only the first line and then closes.
+    }
+    infile.close();
+
+    Vector4d intrinsics;
+    intrinsics << fx, fy, cx, cy;
+    return intrinsics;
+}
+
+/**
+ * Takes poses, writes them to file, in vectors x quaternions(xyzw) fashion
+ *
+ * @param keyframes: vector of poses
+ */
+void write_keyframe_poses_to_file(const string &file_path, const vector<KeyFrame> & keyframes) {
+    ofstream outfile(file_path);
+    for (auto &keyframe: keyframes) {
+        auto & t = keyframe.T_w_c.translation();
+        auto & q = keyframe.T_w_c.unit_quaternion();
+        outfile << keyframe.timestamp << " ";
+        outfile << t.x() << " " << t.y() << " " << t.z() << " ";
+        outfile << q.x() << " " << q.y() << " " << q.z() << " " << q.w();
+        outfile << "\n";
+    }
+    outfile.close();
+    cout << "Writing keyframe poses to file: " << file_path << " successful.";
+}
+
+/**
+ * Returns the local index wrt the frame keyframe, of the point landmarkId (if it was observed by keyframe)
+ *
+ * @param keyframe: the keyframe in which we want to know whether landmarkId was observed
+ * @param lanmarkId: the global index of the point whose local index in keyfram we wish to know
+ * @return local_index: -1 if not found
+ */
+int findLocalPointIndex(const KeyFrame &keyframe, const int landmarkId) {
+    int local_index = -1;
+    for (auto &map_it: keyframe.global_points_map) {
+        if (map_it.second == landmarkId) {
+            local_index = map_it.first;
+        }
+    }
+    return local_index;
+}
+
+/**
+ * Counts the number of observations we add to the cost function, in this keyfram window 
+ *
+ * @param kf_i: initial keyframe of window
+ * @param kf_f: final keyframe of window
+ * @param keyframes: a vector of keyframes, each containing various interesting information (e.g. the pose fo the keyframe)
+ * @param map: the set of all observed 3D points
+ * @return admissible_obs: how many observations were done in this window
+ */
+int countConstraints(const Map3D &map, const vector<KeyFrame> &keyframes, int kf_i, int kf_f) {
+
+    int admissible_obs = 0;
+
+    // Poses, map points (only the relevant ones)
+    for (int kf_n = kf_i; kf_n <= kf_f; kf_n++) {
+
+        // Modify the poses, make them relative to the first frame, add them to the problem
+        auto &curr_kf = keyframes[kf_n];
+
+        // Run over all observations of this keyframe
+        for (auto index_pair: curr_kf.global_points_map) {
+            int localId = index_pair.first;
+
+            auto depth = curr_kf.points3d_local[localId](2);
+
+            // Discard this observation if it has negative depth. todo: to be removed
+            if (depth <= 1e-15) {
+                cout << "Negative and thus unadmissible depth " << depth << endl;
+                continue;
+            }
+
+            admissible_obs++;
+
+        }
+    }
+
+    return admissible_obs;
+
 }
